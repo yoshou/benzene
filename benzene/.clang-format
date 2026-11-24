@@ -1,0 +1,14 @@
+# Format of the C++ sources (hexagon-clang-format from the toolchain image, or any clang-format >= 18)
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -2
+PointerAlignment: Middle
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Empty
+SortIncludes: Never
+IncludeBlocks: Preserve
+SpacesBeforeTrailingComments: 2

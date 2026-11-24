@@ -1,0 +1,7 @@
+{
+  "id": "host-gpu",
+  "version": "1.0.0",
+  "name": "Host GPU access",
+  "description": "At every container start, adds the remote user to the groups that own the host's GPU device nodes (/dev/kfd, /dev/dri)",
+  "entrypoint": "/usr/local/share/host-gpu-init.sh"
+}

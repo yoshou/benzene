@@ -1,0 +1,97 @@
+#ifndef BENZENE_IDL
+#define BENZENE_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+// The references, statistics and sizes of the calls are benzene/include/benzene/protocol.h's, in its namespace of the
+// call's model. Every statistics sequence has at least the model's *_stat::kCount values.
+interface benzene : remote_handle64 {
+    // Hardware facts: architecture, VTCM bytes, HVX contexts (128 bytes), HMX units, the pcycle clock in kHz as timed
+    // during the call.
+    AEEResult info(rout uint32 architecture, rout uint32 vtcm_bytes, rout uint32 hvx_units, rout uint32 hmx_units,
+                   rout uint32 pcycle_khz);
+    // Maps an rpcmem buffer, registered with fastrpc_mmap, into model slot `slot` (< kModelSlots).
+    AEEResult map_model(in int32 file_descriptor, in uint32 bytes, in uint32 slot);
+    // Unmaps model slot `slot` (the host keeps the buffer and may map it again).
+    AEEResult unmap_model(in uint32 slot);
+
+    // The language model's prefill of x [tokens][kLlmHidden] through the layers of references (kLlmLayerReferences
+    // each); rope: cosines [tokens][64], then sines [tokens][64]; y: the hidden states after the last layer,
+    // [tokens][kLlmHidden] or the last row [kLlmHidden]. The layers within the KV cache's layers fill it.
+    AEEResult cosmos3_edge_llm_prefill(in sequence<int32> references, in sequence<float> x, in sequence<float> rope,
+                                       in uint32 tokens, rout sequence<float> y, rout sequence<int32> statistics);
+    // One decode step: x, the token's embedding [kLlmHidden], at the KV cache's next position (rope: its cosines [64],
+    // then sines [64]) through the layers of references, then the head (llm_head_reference) into logits [columns].
+    // references_4bit (may be empty): the 4-bit decode weights instead, kLlmLayer4BitReferences per layer, then
+    // {slot, offset} of the lm_head stream; the head's lm_head and scales are then unused.
+    AEEResult cosmos3_edge_llm_decode_step(in sequence<int32> references, in sequence<int32> head,
+                                           in sequence<int32> references_4bit, in sequence<float> x,
+                                           in sequence<float> rope, rout sequence<float> logits,
+                                           rout sequence<int32> statistics);
+    // The vision encoder: references kVisionLayerReferences per layer, tail kVisionTailReferences; x [patches]
+    // [kVisionHidden] patch + position embeddings; image_offsets: the patch boundaries of 1 .. kMaximumVisionImages
+    // images; y [patches / kPatchesPerVisionToken][kLlmHidden] vision tokens.
+    AEEResult cosmos3_edge_vision_encoder(in sequence<int32> references, in sequence<int32> tail, in sequence<float> x,
+                                          in sequence<int32> image_offsets, rout sequence<float> y,
+                                          rout sequence<int32> statistics);
+    // The session's KV cache for `layers` language model layers and up to `capacity` keys (capacity 0: frees it).
+    AEEResult cosmos3_edge_kv_cache(in uint32 layers, in uint32 capacity);
+    // Allocates the prefill workspace for `prefill_tokens` tokens and the decode workspace ahead of their first use.
+    AEEResult cosmos3_edge_prepare_workspaces(in uint32 prefill_tokens);
+
+    // The transformer: references kBlockReferences per block (DINOv2 blocks, then frame / global pairs), tail
+    // kTailReferences; patches [frames * patch_rows * patch_columns][kPatchInputs] fp16 (normalized pixels, (c, ky, kx)
+    // order, zero-padded); positions [patch_rows * patch_columns][kHidden], the patch grid's position embedding;
+    // special_tokens [kSpecialTokens][kHidden]: cls + pos[0] and the 4 register tokens; kept_outputs (may be empty):
+    // fp16 [kKeptOutputs][frames * tokens per frame][kKeptOutputWidth].
+    AEEResult vggt_transformer(in sequence<int32> references, in sequence<int32> tail, in sequence<uint16> patches,
+                               in sequence<float> positions, in sequence<float> special_tokens, in uint32 frames,
+                               in uint32 patch_rows, in uint32 patch_columns, rout sequence<uint16> kept_outputs,
+                               rout sequence<int32> statistics);
+    // The camera head on the camera tokens of the last vggt_transformer call: references kCameraReferences; pose
+    // [kCameraIterations][frames][kPoseValues] (every iteration).
+    AEEResult vggt_camera_head(in sequence<int32> references, rout sequence<float> pose,
+                               rout sequence<int32> statistics);
+    // A DPT head (channels 2: depth, 4: world points) on the kept outputs of the last vggt_transformer call:
+    // references kDptReferences; position_tables: the UV position tables (dsp/models/vggt/vggt.h
+    // DptHeadArguments::position_tables); y [frames][height][width][channels] (the activated prediction, then the
+    // confidence).
+    AEEResult vggt_dpt_head(in sequence<int32> references, in uint32 channels, in sequence<float> position_tables,
+                            rout sequence<float> y, rout sequence<int32> statistics);
+
+    // An extractor on a gray image [height][width]: references kReferences; the k <= max_keypoints keypoints (x, y),
+    // their scores and fp16 descriptors [k][kDescriptorDimensions]; the features also stay in feature slot
+    // feature_slot (< kFeatureSlots) for the lightglue call. dsp/models/<model>/<model>.h says which keypoints.
+    AEEResult superpoint(in sequence<int32> references, in sequence<uint8> image, in uint32 height, in uint32 width,
+                         in uint32 max_keypoints, in float threshold, in uint32 feature_slot,
+                         rout sequence<float> keypoints, rout sequence<float> scores,
+                         rout sequence<uint16> descriptors, rout sequence<int32> statistics);
+    AEEResult xfeat(in sequence<int32> references, in sequence<uint8> image, in uint32 height, in uint32 width,
+                    in uint32 max_keypoints, in float threshold, in uint32 feature_slot, rout sequence<float> keypoints,
+                    rout sequence<float> scores, rout sequence<uint16> descriptors, rout sequence<int32> statistics);
+    AEEResult aliked(in sequence<int32> references, in sequence<uint8> image, in uint32 height, in uint32 width,
+                     in uint32 max_keypoints, in float threshold, in uint32 feature_slot,
+                     rout sequence<float> keypoints, rout sequence<float> scores, rout sequence<uint16> descriptors,
+                     rout sequence<int32> statistics);
+    // LoMa: references kReferences; the detector image at the detector's size (its first convolution's padding code:
+    // detector_zero_point), the descriptor image at the descriptor's size with DINOv2's patches (fp16 [patches]
+    // [kDinov2PatchInputs]) and positions (fp32 [patches][kDinov2Hidden]); `count` keypoints into feature slot
+    // feature_slot: keypoints [count][2] normalized positions, scores [count], fp32 descriptors
+    // [count][kDescriptorDimensions].
+    AEEResult loma(in sequence<int32> references, in sequence<uint8> detector_image, in uint32 detector_height,
+                   in uint32 detector_width, in uint32 detector_zero_point, in sequence<uint8> descriptor_image,
+                   in uint32 descriptor_height, in uint32 descriptor_width, in sequence<uint16> patches,
+                   in sequence<float> positions, in uint32 count, in uint32 feature_slot,
+                   rout sequence<float> keypoints, rout sequence<float> scores, rout sequence<float> descriptors,
+                   rout sequence<int32> statistics);
+    // LightGlue of model `model` (lightglue::Model) between the features of the slots first_slot and second_slot, both
+    // from the model's extractor: references lightglue::references(model); depth_confidence, width_confidence > 0:
+    // the adaptive inference (<= 0: off); per keypoint of the first, matches (-1: none) and match_scores.
+    AEEResult lightglue(in int32 model, in sequence<int32> references, in uint32 first_slot, in uint32 second_slot,
+                        in float threshold, in float depth_confidence, in float width_confidence,
+                        rout sequence<int32> matches, rout sequence<float> match_scores,
+                        rout sequence<int32> statistics);
+};
+
+#endif

@@ -1,0 +1,5 @@
+build/
+work/
+config/board.env
+__pycache__/
+.vscode/

@@ -1,0 +1,63 @@
+{
+  "name": "Arduino VENTUNO Q NPU (benzene)",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // --network=host : SSH / mDNS (xxx.local) to the board behave exactly as on the host
+  // --privileged + /dev bind : the host's AMD GPUs (/dev/kfd, /dev/dri; group access is set up by ./host-gpu)
+  "runArgs": ["--network=host", "--privileged"],
+
+  "mounts": [
+    "source=/dev,target=/dev,type=bind",
+    // Resolve mDNS names via the host's avahi-daemon (remove this line if the host has no avahi)
+    "source=/var/run/avahi-daemon/socket,target=/var/run/avahi-daemon/socket,type=bind",
+    // Persist the models' venv, its Python and the uv cache in a volume (no re-download on container rebuild)
+    "source=ventunoq-torch,target=/opt/torch,type=volume",
+    // Host SSH config, read-only (copied to ~/.ssh by post-create)
+    "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh-host,type=bind,readonly"
+  ],
+
+  "features": {
+    // Use the host's Docker (benzene/build.sh builds in the Snapdragon toolchain image)
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+    // Give vscode access to the host's GPU device nodes, whose group IDs come from the host (render etc.)
+    "./host-gpu": {}
+  },
+
+  "containerEnv": {
+    // Set to 0 to skip pulling the Snapdragon toolchain image (scripts/_common.sh) in post-create; benzene/build.sh
+    // then pulls it on its first run
+    "TOOLCHAIN_AUTO_PULL": "1",
+    // Set to 0 to skip installing the models' venv (scripts/install-venv.sh) in post-create
+    "VENV_AUTO_INSTALL": "1"
+  },
+
+  // Host path of the workspace. Docker is the host's daemon, so bind mounts in `docker run`
+  // (benzene/build.sh) must name host paths, not container paths
+  "remoteEnv": {
+    "LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}"
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "remoteUser": "vscode",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools-extension-pack",
+        "ms-vscode.cmake-tools",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "ms-vscode-remote.remote-ssh",
+        "redhat.vscode-yaml",
+        "timonwong.shellcheck"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/torch/venv-models/bin/python",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}
