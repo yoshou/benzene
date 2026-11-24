@@ -140,3 +140,8 @@ python -c 'import torch; print(torch.cuda.device_count())'   # ROCm uses the tor
 - `--privileged` plus the `/dev` bind gives access to the host's GPUs.
 - The host's `~/.ssh` is mounted read-only and copied to `~/.ssh` by post-create.
 - Docker is the host's daemon (docker-outside-of-docker). Bind-mount sources in `docker run -v` are resolved on the host, so use host paths: `LOCAL_WORKSPACE_FOLDER` (`remoteEnv`) holds the workspace's host path.
+
+## License
+
+MIT (`LICENSE`). The models' sources, weights and datasets that `scripts/download-inputs.sh` fetches into `work/` are
+not part of this repository and come under their own licenses.
