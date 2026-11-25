@@ -24,6 +24,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 
 import torch
 
@@ -93,10 +94,11 @@ def spec_of(recipe: list, name: str) -> dict | None:
     return None
 
 
-def _cache_path(name: str, spec: dict):
+def cache_path(name: str, spec: dict, out_dir: Path) -> tuple[Path, dict]:
+    """The cache file of a layer's quantized weight under a port's out_dir, and its key (the spec's weight fields)."""
     key = {k: spec.get(k) for k in ("fmt", "method", "act_order", "smooth")}
     h = hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:10]
-    return OUT_DIR / "qweights" / h / f"{name}.pt", key
+    return out_dir / "qweights" / h / f"{name}.pt", key
 
 
 def smooth_vector(mod: torch.nn.Module, amax: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -110,16 +112,18 @@ def smooth_vector(mod: torch.nn.Module, amax: torch.Tensor, alpha: float) -> tor
 
 
 @torch.no_grad()
-def quantize_weight(name: str, mod: torch.nn.Module, spec: dict, smooth: torch.Tensor | None) -> torch.Tensor:
-    """Dequantized fp32 GEMM weight (weight_matrix layout, times the smoothing vector); cached on disk."""
+def quantize_weight(name: str, mod: torch.nn.Module, spec: dict, smooth: torch.Tensor | None,
+                    out_dir: Path) -> torch.Tensor:
+    """Dequantized fp32 GEMM weight (weight_matrix layout, times the smoothing vector); cached on disk under out_dir
+    (the port's: its Hessians are there too)."""
     from .calibrate import load_hessian
 
-    path, key = _cache_path(name, spec)
+    path, key = cache_path(name, spec, out_dir)
     if path.exists():
         return torch.load(path, map_location=mod.weight.device)["w"].float()
     fmt = FORMATS[spec["fmt"]]
     w = weight_matrix(mod).float()
-    H = load_hessian(name, w.device)["H"].float() if spec["method"] == "gptq" or fmt.group else None
+    H = load_hessian(name, w.device, out_dir)["H"].float() if spec["method"] == "gptq" or fmt.group else None
     if smooth is not None:
         ks = smooth.repeat_interleave(taps(mod)) if isinstance(mod, torch.nn.Conv2d) else smooth
         w = w * ks[None, :]
@@ -140,10 +144,17 @@ def quantize_weight(name: str, mod: torch.nn.Module, spec: dict, smooth: torch.T
 
 
 @torch.no_grad()
-def apply_recipe(model, recipe_name: str, verbose: bool = True) -> dict:
+def apply_recipe(model, recipe_name: str, verbose: bool = True, recipes: dict | None = None,
+                 out_dir: Path | None = None) -> dict:
+    """Quantizes the model's layers by the recipe: quantized weights in place, W8A8 layers replaced by their
+    fake-quant modules (ActQuantLinear, ActQuantConv). recipes and out_dir (its quantized weights and Hessians): VGGT's
+    RECIPES and OUT_DIR, or both another VGGT-architecture port's."""
     from .calibrate import load_hessian
 
-    prec, recipe = RECIPES[recipe_name]
+    if (recipes is None) != (out_dir is None):
+        raise ValueError("a port's recipes go with its out_dir")
+    recipes, out_dir = (RECIPES, OUT_DIR) if recipes is None else (recipes, out_dir)
+    prec, recipe = recipes[recipe_name]
     t0 = time.time()
     names = [n for n, m in model.named_modules() if isinstance(m, QUANTIZABLE)]
     replaced, params = 0, 0
@@ -154,8 +165,8 @@ def apply_recipe(model, recipe_name: str, verbose: bool = True) -> dict:
         mod = model.get_submodule(name)
         smooth = None
         if spec.get("a8") and spec.get("smooth") is not None:
-            smooth = smooth_vector(mod, load_hessian(name, mod.weight.device)["amax"], spec["smooth"])
-        q = quantize_weight(name, mod, spec, smooth)
+            smooth = smooth_vector(mod, load_hessian(name, mod.weight.device, out_dir)["amax"], spec["smooth"])
+        q = quantize_weight(name, mod, spec, smooth, out_dir)
         if spec.get("a8"):
             new = (ActQuantLinear(mod, q, smooth, mode="tok") if isinstance(mod, torch.nn.Linear)
                    else ActQuantConv(mod, q, smooth, mode=spec.get("amode", "tok")))

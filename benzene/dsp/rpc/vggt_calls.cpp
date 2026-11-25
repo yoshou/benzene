@@ -70,7 +70,7 @@ AEEResult benzene_vggt_dpt_head(remote_handle64 handle, const int32_t * referenc
                                 int y_length, int32_t * statistics, int statistics_length) {
     Session * session = session_from_handle(handle);
     if (session == nullptr || references_length != protocol::kDptReferences ||
-        statistics_length < protocol::dpt_stat::kCount) {
+        statistics_length < benzene::protocol::dpt_head::stat::kCount) {
         return AEE_EBADPARM;
     }
     const vggt::KeptGeometry geometry = vggt::kept_geometry(*session);

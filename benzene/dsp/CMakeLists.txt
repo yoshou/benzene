@@ -25,16 +25,19 @@ set(KERNEL_SOURCES
     kernels/gemv/gemv.cpp)
 set(MODEL_SOURCES
     models/aliked/aliked.cpp
+    models/anysplat/anysplat.cpp
     models/cosmos3_edge/cosmos3_edge.cpp
     models/lightglue/lightglue.cpp
     models/loma/loma.cpp
     models/shared/cell_heatmap.cpp
+    models/shared/dpt_head.cpp
     models/shared/feature_slots.cpp
     models/shared/vision_transformer.cpp
     models/superpoint/superpoint.cpp
     models/vggt/vggt.cpp
     models/xfeat/xfeat.cpp)
 set(RPC_SOURCES
+    rpc/anysplat_calls.cpp
     rpc/cosmos3_edge_calls.cpp
     rpc/extractor_calls.cpp
     rpc/lightglue_calls.cpp

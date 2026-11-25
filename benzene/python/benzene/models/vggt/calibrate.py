@@ -2,7 +2,8 @@
 receptive fields, convolution_quantization.gemm_rows) and the per-input-channel |x| max (SmoothQuant).
 
 The model runs on --device (aggregator under fp16 autocast, heads in fp32 as the official forward); the statistics
-accumulate in fp32 on --hessian-device and go to OUT_DIR/hessians/<module>.pt.
+accumulate in fp32 on --hessian-device and go to OUT_DIR/hessians/<module>.pt (collect_hessians; ports of other
+VGGT-architecture models collect into their own OUT_DIR, benzene.models.anysplat.calibrate).
 
   python -m benzene.models.vggt.calibrate --group tf      # DINOv2 blocks, frame / global blocks, patch embedding
   python -m benzene.models.vggt.calibrate --group heads   # camera head, DPT heads
@@ -16,6 +17,8 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 import torch
 
@@ -24,7 +27,6 @@ from .paths import DATA_DIR, OUT_DIR
 from .recipes import CAM, DPT, PATCH, QUANTIZABLE, TF
 from .runner import load_model, load_sample, predict
 
-HESSIAN_DIR = OUT_DIR / "hessians"
 GROUPS = {"tf": TF + [PATCH], "heads": [CAM, DPT]}
 
 
@@ -33,8 +35,48 @@ def calibration_files(count: int | None = None) -> list[str]:
     return files[:count] if count else files
 
 
-def load_hessian(name: str, device) -> dict:
-    return torch.load(HESSIAN_DIR / f"{name}.pt", map_location=device)
+def load_hessian(name: str, device, out_dir: Path) -> dict:
+    return torch.load(out_dir / "hessians" / f"{name}.pt", map_location=device)
+
+
+def collect_hessians(model: torch.nn.Module, patterns: list[str], files: list[str],
+                     run: Callable[[torch.nn.Module, str], None], hessian_device: str, out_dir: Path,
+                     group: str) -> None:
+    """Hessians and |x| maxima of the QUANTIZABLE modules whose names match one of `patterns`, over run(model, file)
+    for the files -> out_dir/hessians/<module>.pt (out_dir: the port's)."""
+    hessian_dir = out_dir / "hessians"
+    pats = [re.compile(p) for p in patterns]
+    hessian_dir.mkdir(parents=True, exist_ok=True)
+    acc: dict[str, dict] = {}
+
+    def hook(name):
+        def fn(mod, inp, out):
+            a = acc[name]
+            for r in gemm_rows(mod, inp[0]):
+                r = r.to(hessian_device)
+                a["H"].addmm_(r.T, r)
+                a["n"] += r.shape[0]
+            a["amax"] = torch.maximum(a["amax"], channel_amax(mod, inp[0]).float().to(hessian_device))
+        return fn
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, QUANTIZABLE) and any(p.search(name) for p in pats):
+            k = weight_matrix(mod).shape[1]
+            cin = mod.in_features if isinstance(mod, torch.nn.Linear) else mod.in_channels
+            acc[name] = {"H": torch.zeros(k, k, device=hessian_device), "n": 0,
+                         "amax": torch.zeros(cin, device=hessian_device)}
+            mod.register_forward_hook(hook(name))
+    gib = sum(a["H"].numel() * 4 for a in acc.values()) / 2**30
+    print(f"{group}: {len(acc)} layers, {gib:.1f} GiB of Hessians on {hessian_device}", flush=True)
+    t0 = time.time()
+    for i, f in enumerate(files):
+        run(model, f)
+        if i % 8 == 0:
+            print(f"  {time.strftime('%H:%M:%S')} {i + 1}/{len(files)} samples {time.time() - t0:.0f}s", flush=True)
+    for name, a in acc.items():
+        torch.save({"H": (a["H"] / a["n"]).cpu(), "n": a["n"], "amax": a["amax"].cpu()}, hessian_dir / f"{name}.pt")
+    (hessian_dir / f".done_{group}").write_text(str(len(files)))
+    print(f"saved {len(acc)} to {hessian_dir} ({time.time() - t0:.0f}s)", flush=True)
 
 
 def main() -> None:
@@ -44,41 +86,12 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--hessian-device", default="cuda:1")
     args = parser.parse_args()
-    model = load_model(args.device)
-    pats = [re.compile(p) for p in GROUPS[args.group]]
-    HESSIAN_DIR.mkdir(parents=True, exist_ok=True)
-    acc: dict[str, dict] = {}
 
-    def hook(name):
-        def fn(mod, inp, out):
-            a = acc[name]
-            for r in gemm_rows(mod, inp[0]):
-                r = r.to(args.hessian_device)
-                a["H"].addmm_(r.T, r)
-                a["n"] += r.shape[0]
-            a["amax"] = torch.maximum(a["amax"], channel_amax(mod, inp[0]).float().to(args.hessian_device))
-        return fn
+    def run(model, f):
+        predict(model, load_sample(f, args.device)["x"], agg=torch.float16, head=None)
 
-    for name, mod in model.named_modules():
-        if isinstance(mod, QUANTIZABLE) and any(p.search(name) for p in pats):
-            k = weight_matrix(mod).shape[1]
-            cin = mod.in_features if isinstance(mod, torch.nn.Linear) else mod.in_channels
-            acc[name] = {"H": torch.zeros(k, k, device=args.hessian_device), "n": 0,
-                         "amax": torch.zeros(cin, device=args.hessian_device)}
-            mod.register_forward_hook(hook(name))
-    gib = sum(a["H"].numel() * 4 for a in acc.values()) / 2**30
-    print(f"{args.group}: {len(acc)} layers, {gib:.1f} GiB of Hessians on {args.hessian_device}", flush=True)
-    t0 = time.time()
-    files = calibration_files(args.count)
-    for i, f in enumerate(files):
-        s = load_sample(f, args.device)
-        predict(model, s["x"], agg=torch.float16, head=None)
-        if i % 8 == 0:
-            print(f"  {time.strftime('%H:%M:%S')} {i + 1}/{len(files)} samples {time.time() - t0:.0f}s", flush=True)
-    for name, a in acc.items():
-        torch.save({"H": (a["H"] / a["n"]).cpu(), "n": a["n"], "amax": a["amax"].cpu()}, HESSIAN_DIR / f"{name}.pt")
-    (HESSIAN_DIR / f".done_{args.group}").write_text(str(len(files)))
-    print(f"saved {len(acc)} to {HESSIAN_DIR} ({time.time() - t0:.0f}s)", flush=True)
+    collect_hessians(load_model(args.device), GROUPS[args.group], calibration_files(args.count), run,
+                     args.hessian_device, OUT_DIR, args.group)
     sys.stdout.flush()
     os._exit(0)  # skip ROCm teardown (it can segfault after all work is saved)
 

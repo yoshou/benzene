@@ -16,4 +16,7 @@ bool parse_command_line(int argc, char ** argv, int positional, const Option * o
 // A whole decimal integer in [minimum, maximum] (false and a message otherwise).
 bool parse_integer(const char * text, const char * what, int minimum, int maximum, int * value);
 
+// A finite decimal number in [minimum, maximum] (false and a message otherwise).
+bool parse_float(const char * text, const char * what, float minimum, float maximum, float * value);
+
 }  // namespace benzene::host

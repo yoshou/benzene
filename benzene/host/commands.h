@@ -9,6 +9,7 @@ int run_xfeat_lightglue(int argc, char ** argv);
 int run_aliked_lightglue(int argc, char ** argv);
 int run_loma(int argc, char ** argv);
 int run_vggt(int argc, char ** argv);
+int run_anysplat(int argc, char ** argv);
 int run_cosmos3_edge_llm_prefill(int argc, char ** argv);
 int run_cosmos3_edge_llm_decode(int argc, char ** argv);
 int run_cosmos3_edge_vision(int argc, char ** argv);

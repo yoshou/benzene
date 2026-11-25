@@ -194,6 +194,69 @@ enum class BlockKind : int32_t { kDinov2 = 0, kFrame = 1, kGlobal = 2 };
 
 }  // namespace vision_transformer
 
+// The DPT head of VGGT's architecture on the transformer's kept outputs (VGGT's depth and point heads, AnySplat's
+// Gaussian head) as dsp/models/shared/dpt_head runs it.
+namespace dpt_head {
+
+// The convolutions in run order, one model-file tensor each.
+namespace convolution {
+enum : int {
+    kProject0 = 0,  // projects[k]: 1x1, 2048 -> 256 / 512 / 1024 / 1024
+    kProject1,
+    kProject2,
+    kProject3,
+    kResize0,   // resize: ConvTranspose 4x4 stride 4 (256)
+    kResize1,   // ConvTranspose 2x2 stride 2 (512)
+    kResize3,   // conv 3x3 stride 2
+    kLayer1Rn,  // scratch.layer<k>_rn: 3x3 -> 256, no bias
+    kLayer2Rn,
+    kLayer3Rn,
+    kLayer4Rn,
+    kRefine4Unit2Conv1,  // refinenet4: resConfUnit2 conv1 / conv2, out_conv (1x1)
+    kRefine4Unit2Conv2,
+    kRefine4Output,
+    kRefine3Unit1Conv1,  // refinenet3: resConfUnit1, resConfUnit2, out_conv
+    kRefine3Unit1Conv2,
+    kRefine3Unit2Conv1,
+    kRefine3Unit2Conv2,
+    kRefine3Output,
+    kRefine2Unit1Conv1,
+    kRefine2Unit1Conv2,
+    kRefine2Unit2Conv1,
+    kRefine2Unit2Conv2,
+    kRefine2Output,
+    kRefine1Unit1Conv1,
+    kRefine1Unit1Conv2,
+    kRefine1Unit2Conv1,
+    kRefine1Unit2Conv2,
+    kRefine1Output,
+    kOutputConv1,  // output_conv1 (3x3 256 -> 128)
+    kOutputConv2,  // output_conv2.0 (3x3 128 -> 32; AnySplat's Gaussian head: -> 128)
+    kCount
+};
+}  // namespace convolution
+
+// A convolution's gemm_fp16 weight stream: K = taps x channels, tap-major; a transposed convolution has its columns in
+// (tap, channel) order; the bias is in the store blocks.
+namespace convolution_part {
+enum : int { kWeights = 0, kCount };
+}  // namespace convolution_part
+
+namespace stat {
+enum : int {
+    kProjectsMicroseconds = 0,  // the projects and the resizes
+    kLayerRnMicroseconds,
+    kRefineNetsMicroseconds,
+    kOutputConvolutionsMicroseconds,
+    kElementwiseMicroseconds,
+    kTotalMicroseconds,
+    kWorkspaceMicroseconds,  // the workspace and the position tables
+    kCount
+};
+}  // namespace stat
+
+}  // namespace dpt_head
+
 namespace vggt {
 
 constexpr int kHidden = 1024;
@@ -243,58 +306,15 @@ constexpr int kCameraTrunkBlocks = 4;
 constexpr int kCameraReferences =
     kCameraTrunkBlocks * blob_references(vision_transformer::block_part::kCount) + blob_references(camera_part::kCount);
 
-// The DPT head's convolutions in run order, one model-file tensor each.
-namespace dpt_convolution {
-enum : int {
-    kProject0 = 0,  // projects[k]: 1x1, 2048 -> 256 / 512 / 1024 / 1024
-    kProject1,
-    kProject2,
-    kProject3,
-    kResize0,   // resize: ConvTranspose 4x4 stride 4 (256)
-    kResize1,   // ConvTranspose 2x2 stride 2 (512)
-    kResize3,   // conv 3x3 stride 2
-    kLayer1Rn,  // scratch.layer<k>_rn: 3x3 -> 256, no bias
-    kLayer2Rn,
-    kLayer3Rn,
-    kLayer4Rn,
-    kRefine4Unit2Conv1,  // refinenet4: resConfUnit2 conv1 / conv2, out_conv (1x1)
-    kRefine4Unit2Conv2,
-    kRefine4Output,
-    kRefine3Unit1Conv1,  // refinenet3: resConfUnit1, resConfUnit2, out_conv
-    kRefine3Unit1Conv2,
-    kRefine3Unit2Conv1,
-    kRefine3Unit2Conv2,
-    kRefine3Output,
-    kRefine2Unit1Conv1,
-    kRefine2Unit1Conv2,
-    kRefine2Unit2Conv1,
-    kRefine2Unit2Conv2,
-    kRefine2Output,
-    kRefine1Unit1Conv1,
-    kRefine1Unit1Conv2,
-    kRefine1Unit2Conv1,
-    kRefine1Unit2Conv2,
-    kRefine1Output,
-    kOutputConv1,  // output_conv1 (3x3 256 -> 128)
-    kOutputConv2,  // output_conv2.0 (3x3 -> 32)
-    kCount
-};
-}  // namespace dpt_convolution
-
-// A convolution's gemm_fp16 weight stream: K = taps x channels, tap-major; a transposed convolution has its columns in
-// (tap, channel) order; the bias is in the store blocks.
-namespace dpt_convolution_part {
-enum : int { kWeights = 0, kCount };
-}  // namespace dpt_convolution_part
-
-// norm weight / bias [2048], output_conv2.2 weight [channels][32] and bias [channels] (fp32)
+// The depth and point heads' blob after their DPT head convolutions (dpt_head::convolution): norm weight / bias
+// [2048], output_conv2.2 weight [channels][32] and bias [channels] (fp32)
 namespace dpt_head_part {
 enum : int { kNormGamma = 0, kNormBeta, kLastConvWeights, kLastConvBias, kCount };
 }  // namespace dpt_head_part
 
-// Per convolution {slot, offset, dpt_convolution_part parts}, then {slot, offset, dpt_head_part parts}.
-constexpr int kDptReferences =
-    dpt_convolution::kCount * blob_references(dpt_convolution_part::kCount) + blob_references(dpt_head_part::kCount);
+// Per convolution {slot, offset, dpt_head::convolution_part parts}, then {slot, offset, dpt_head_part parts}.
+constexpr int kDptReferences = dpt_head::convolution::kCount * blob_references(dpt_head::convolution_part::kCount) +
+                               blob_references(dpt_head_part::kCount);
 
 // After the block stages (block_stat)
 namespace transformer_stat {
@@ -312,20 +332,44 @@ namespace camera_stat {
 enum : int { kMicroseconds = 0, kCount };
 }  // namespace camera_stat
 
-namespace dpt_stat {
+}  // namespace vggt
+
+// AnySplat: VGGT's transformer, camera head and depth head (namespace vggt, with AnySplat's weights), and its Gaussian
+// head: the DPT head (dpt_head) whose output_conv2.0 is a 3x3 128 -> 128 convolution, with the image merger (a 7x7
+// 3 -> 128 convolution of the image in [0, 1], ReLU) added to the upsampled features and a 1x1 output convolution.
+namespace anysplat {
+
+// Per pixel: the opacity logit, scale (3), rotation (4, x y z w), SH (3 x 25, channel-major), the confidence.
+constexpr int kGaussianChannels = 84;
+constexpr int kGaussianOutputChannels = 96;  // per pixel in the call's output: kGaussianChannels, then zeros
+constexpr int kMergerKernel = 7;
+// The merger as a GEMM with a tap per window row: a pixel's strip holds the 3 x 7 image values of its window row
+// (channel, column) in [0, 1], zero-padded; the GEMM's K is (window row, strip value).
+constexpr int kMergerStrip = 64;
+constexpr int kMergerInputs = kMergerKernel * kMergerStrip;
+
+// The Gaussian head's blob after its DPT convolutions
+namespace gaussian_head_part {
 enum : int {
-    kProjectsMicroseconds = 0,  // the projects and the resizes
-    kLayerRnMicroseconds,
-    kRefineNetsMicroseconds,
-    kOutputConvolutionsMicroseconds,
-    kElementwiseMicroseconds,
-    kTotalMicroseconds,
-    kWorkspaceMicroseconds,  // the workspace and the position tables
+    kNormGamma = 0,  // norm weight / bias [2048] (fp32)
+    kNormBeta,
+    kMergerWeights,  // input_merger.0 as the fp16 GEMM stream (K = kMergerInputs, 128 columns)
+    kOutputWeights,  // output_conv2.2 as the fp16 GEMM stream (K = 128, kGaussianOutputChannels columns)
     kCount
 };
-}  // namespace dpt_stat
+}  // namespace gaussian_head_part
 
-}  // namespace vggt
+// Per convolution {slot, offset, dpt_head::convolution_part parts}, then {slot, offset, gaussian_head_part parts}.
+constexpr int kGaussianReferences =
+    dpt_head::convolution::kCount * blob_references(dpt_head::convolution_part::kCount) +
+    blob_references(gaussian_head_part::kCount);
+
+// After the DPT head's stages (dpt_head::stat)
+namespace gaussian_stat {
+enum : int { kMergerMicroseconds = dpt_head::stat::kCount, kCount };  // the strips and the merger GEMM
+}  // namespace gaussian_stat
+
+}  // namespace anysplat
 
 namespace superpoint {
 

@@ -2,10 +2,10 @@
 # The models' external inputs, pinned, into work/ (benzene/python/benzene/workspace.py). What is already there is
 # checked (commit, checksum, Hugging Face revision) and kept:
 #   source checkouts   cvg/LightGlue, verlab/accelerated_features (XFeat, with its weights), davnords/LoMa,
-#                      facebookresearch/vggt
+#                      facebookresearch/vggt, InternRobotics/AnySplat
 #   weights            LightGlue v0.1_arxiv (SuperPoint, LightGlue for SuperPoint and ALIKED), ALIKED-n16, LoMa, DaD
-#   Hugging Face hub   facebook/VGGT-1B, nvidia/Cosmos3-Edge; the Cosmos 3 Edge benchmarks nyu-visionx/CV-Bench,
-#                      lmms-lab/RealWorldQA
+#   Hugging Face hub   facebook/VGGT-1B, lhjiang/anysplat, nvidia/Cosmos3-Edge; the Cosmos 3 Edge benchmarks
+#                      nyu-visionx/CV-Bench, lmms-lab/RealWorldQA
 #   datasets           TUM RGB-D sequences (CC BY 4.0), Mip-NeRF 360 and its extra scenes (images_8, COLMAP sparse and
 #                      poses_bounds.npy)
 # The hf command comes from the models' venv (scripts/install-venv.sh).
@@ -46,6 +46,7 @@ checkout https://github.com/verlab/accelerated_features.git e92685f57f8318b18725
   "$WORK/xfeat_lightglue/src"
 checkout https://github.com/davnords/LoMa.git ecc947d44ddc9d50387e887bbedc743d65ffac00 "$WORK/loma/src"
 checkout https://github.com/facebookresearch/vggt.git a288dd0f14786c93483e45524328726ab7b1b4ce "$WORK/vggt/src"
+checkout https://github.com/InternRobotics/AnySplat.git 5f5e208a7dd57d52e43ea0d553a95eab526e8775 "$WORK/anysplat/src"
 
 L=https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv
 weight $L/superpoint_v1.pth 52b6708629640ca883673b5d5c097c4ddad37d8048b33f09c8ca0d69db12c40e \
@@ -67,6 +68,8 @@ weight https://github.com/Parskatt/dad/releases/download/v0.1.0/dad.pth \
 
 hub facebook/VGGT-1B model 860abec7937da0a4c03c41d3c269c366e82abdf9 "$WORK/vggt/hf/VGGT-1B" \
   README.md config.json model.safetensors
+hub lhjiang/anysplat model d2e8c343672646041ad4ea518184968f94362f01 "$WORK/anysplat/hf/anysplat" \
+  README.md LICENSE config.json model.safetensors
 hub nvidia/Cosmos3-Edge model 6afc1256321c3a8e623d89be3bc5117a1e90f96b "$WORK/cosmos3_edge/hf/Cosmos3-Edge" \
   README.md chat_template.jinja config.json generation_config.json model.safetensors.index.json \
   preprocessor_config.json processor_config.json special_tokens_map.json tokenizer.json tokenizer_config.json \

@@ -8,6 +8,7 @@ include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
 include(ExternalProject)
 
 add_executable(benzene
+    host/anysplat_commands.cpp
     host/command_line.cpp
     host/cosmos3_edge_commands.cpp
     host/fastrpc.cpp
@@ -19,6 +20,7 @@ add_executable(benzene
     host/model_file.cpp
     host/timing.cpp
     host/vggt_commands.cpp
+    host/vggt_network.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/benzene_stub.c)
 build_idl(benzene.idl benzene)
 set_target_properties(benzene PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)

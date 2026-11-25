@@ -9,8 +9,8 @@ Contents (tensor names):
                              GEMM (protocol.h vggt::tail_part)
   vggt.cam.blocks.<i>        the camera head's 4 trunk blocks (vision_transformer::block_part, 2048 / 8192 dims)
   vggt.cam.head              the rest of the camera head (vggt::camera_part)
-  vggt.dpt.<h>.<i>           DPT heads h = depth, point: convolution i in vggt::dpt_convolution order as the fp16 HMX
-                             GEMM's weight stream (vggt::dpt_convolution_part)
+  vggt.dpt.<h>.<i>           DPT heads h = depth, point: convolution i in dpt_head::convolution order as the fp16 HMX
+                             GEMM's weight stream (dpt_head::convolution_part)
   vggt.dpt.<h>.misc          norm, output_conv2.2 (vggt::dpt_head_part)
 
   python -m benzene.models.vggt.export_hexmodel w8a8_tfc
@@ -24,8 +24,7 @@ from pathlib import Path
 
 from benzene.model_file import Writer
 
-from .device_layout import (DPT_CONVS, blob_block, blob_cam_head, blob_dpt_conv, blob_dpt_misc, blob_tail, block_names,
-                            ckpt)
+from .device_layout import DPT_CONVS, VGGT, block_names, ckpt
 from .paths import MODEL_DIR, WORK
 from .recipes import DEVICE_RECIPE
 
@@ -48,17 +47,17 @@ def main() -> None:
     w.f32("vggt.cls_token", ckpt(pe + "cls_token").reshape(1024))
     w.f32("vggt.register_tokens", ckpt(pe + "register_tokens").reshape(4, 1024))
     for l, (pre, kind) in enumerate(block_names()):
-        w.blob(f"vggt.blocks.{l}", blob_block(args.recipe, pre, kind > 0))
+        w.blob(f"vggt.blocks.{l}", VGGT.blob_block(args.recipe, pre, kind > 0))
         print("block", l, pre, flush=True)
-    w.blob("vggt.tail", blob_tail())
+    w.blob("vggt.tail", VGGT.blob_tail())
     for i in range(4):
-        w.blob(f"vggt.cam.blocks.{i}", blob_block(args.recipe, f"camera_head.trunk.{i}.", False))
-    w.blob("vggt.cam.head", blob_cam_head(args.recipe))
+        w.blob(f"vggt.cam.blocks.{i}", VGGT.blob_block(args.recipe, f"camera_head.trunk.{i}.", False))
+    w.blob("vggt.cam.head", VGGT.blob_cam_head(args.recipe))
     print("camera head", flush=True)
     for h in ("depth", "point"):
         for i, conv in enumerate(DPT_CONVS):
-            w.blob(f"vggt.dpt.{h}.{i}", blob_dpt_conv(h, conv))
-        w.blob(f"vggt.dpt.{h}.misc", blob_dpt_misc(h))
+            w.blob(f"vggt.dpt.{h}.{i}", VGGT.blob_dpt_conv(h, conv))
+        w.blob(f"vggt.dpt.{h}.misc", VGGT.blob_dpt_misc(h))
         print(f"{h} head", flush=True)
     size = w.finish({"model": "VGGT-1B", "recipe": args.recipe, "config": json.loads((MODEL_DIR / "config.json").read_text())})
     print(f"wrote {w.path} ({size / 2**30:.2f} GiB)")

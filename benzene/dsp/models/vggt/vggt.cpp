@@ -4,15 +4,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 
 #include "dsp/hvx/lane_movement.h"
 #include "dsp/hvx/prefetch.h"
-#include "dsp/hvx/reductions.h"
-#include "dsp/hvx/scalar_math.h"
 #include "dsp/hvx/vector.h"
 #include "dsp/kernels/gemm_fp16/gemm_fp16.h"
 #include "dsp/kernels/gemm_w8a8/gemm_w8a8.h"
+#include "dsp/models/shared/dpt_head.h"
 #include "dsp/models/shared/layer_weights.h"
 #include "dsp/models/shared/vision_transformer.h"
 #include "dsp/runtime/heap.h"
@@ -28,18 +26,18 @@ namespace {
 
 namespace block_part = protocol::vision_transformer::block_part;
 namespace camera_part = protocol::vggt::camera_part;
-namespace convolution = protocol::vggt::dpt_convolution;
+namespace convolution = protocol::dpt_head::convolution;
 namespace gemm = kernels::gemm_w8a8;
 namespace gemm_fp16 = kernels::gemm_fp16;
 namespace tail_part = protocol::vggt::tail_part;
 namespace camera_stat = protocol::vggt::camera_stat;
-namespace dpt_stat = protocol::vggt::dpt_stat;
+namespace dpt_head_part = protocol::vggt::dpt_head_part;
+namespace dpt_stat = protocol::dpt_head::stat;
 namespace transformer_stat = protocol::vggt::transformer_stat;
 using gemm::Activation;
 using gemm::OutputForm;
 using hvx::Mask;
 using hvx::Vector;
-using hvx::VectorPair;
 using protocol::vggt::kPatchSize;
 using protocol::vggt::kPoseValues;
 using protocol::vggt::kSpecialTokens;
@@ -49,6 +47,7 @@ using vision_transformer::kMaximumFrames;
 
 constexpr int kKeptPairs[protocol::vggt::kKeptOutputs] = {4, 11, 17, 23};
 constexpr int kKeepItemRows = 16;
+static_assert(protocol::vggt::kKeptOutputs == dpt_head::kKeptOutputs);
 
 // One call at a time: the calls share the session's state (the heads read the transformer's kept outputs).
 struct CallGuard {
@@ -346,244 +345,6 @@ runtime::Status run_head(runtime::Session & session, const LayerWeights blocks[k
     return {};
 }
 
-constexpr int kFeatures = 256;
-constexpr int kProjectChannels[4] = {256, 512, 1024, 1024};
-
-struct DptWorkspace {
-    int patch_rows;
-    int patch_columns;
-    int height;
-    int width;
-    int stride2_rows;
-    int stride2_columns;
-    runtime::HeapArray<_Float16> normalized;
-    runtime::HeapArray<_Float16> project_positions[4];
-    runtime::HeapArray<_Float16> projected[4];
-    runtime::HeapArray<_Float16> layer1;
-    runtime::HeapArray<_Float16> layer2;
-    runtime::HeapArray<_Float16> layer4;
-    runtime::HeapArray<_Float16> fusion_inputs[4];
-    runtime::HeapArray<_Float16> temporary;
-    runtime::HeapArray<_Float16> refined;
-    runtime::HeapArray<_Float16> fused;
-    runtime::HeapArray<_Float16> upsampled;
-    runtime::HeapArray<_Float16> fusion_output;
-    runtime::HeapArray<_Float16> head_features;
-    runtime::HeapArray<_Float16> image_features;
-    runtime::HeapArray<float> last_hidden_rows;
-    runtime::HeapArray<float> column_positions;
-    runtime::HeapArray<float> row_positions;
-    runtime::HeapArray<int> stride2_taps;
-    runtime::HeapArray<int> transposed_rows[2];
-};
-
-runtime::HeapArray<int> make_tap_map(int input_rows, int input_columns, int stride, int output_rows,
-                                     int output_columns) {
-    runtime::HeapArray<int> map = runtime::allocate_array<int>(static_cast<size_t>(output_rows) * output_columns * 9);
-    if (!map) return map;
-
-    for (int oy = 0; oy < output_rows; oy++) {
-        for (int ox = 0; ox < output_columns; ox++) {
-            for (int tap = 0; tap < 9; tap++) {
-                const int iy = oy * stride - 1 + tap / 3;
-                const int ix = ox * stride - 1 + tap % 3;
-                map[(static_cast<size_t>(oy) * output_columns + ox) * 9 + tap] =
-                    (iy >= 0 && iy < input_rows && ix >= 0 && ix < input_columns) ? iy * input_columns + ix : -1;
-            }
-        }
-    }
-    return map;
-}
-
-int position_table_values(int patch_rows, int patch_columns) {
-    return (patch_columns + patch_rows) * (128 + 256 + 512 + 512) +
-           (kPatchSize * patch_columns + kPatchSize * patch_rows) * 64;
-}
-
-runtime::Status allocate_workspace(DptWorkspace * w, int patch_rows, int patch_columns, const float * position_tables) {
-    if (w->normalized && w->patch_rows == patch_rows && w->patch_columns == patch_columns) return {};
-
-    *w = DptWorkspace{};
-    w->patch_rows = patch_rows;
-    w->patch_columns = patch_columns;
-    w->height = patch_rows * kPatchSize;
-    w->width = patch_columns * kPatchSize;
-    w->stride2_rows = (patch_rows - 1) / 2 + 1;
-    w->stride2_columns = (patch_columns - 1) / 2 + 1;
-    const size_t patches = static_cast<size_t>(patch_rows) * patch_columns;
-    const size_t H = w->height;
-    const size_t W = w->width;
-
-    bool allocated = runtime::allocate(w->normalized, patches * 2048);
-    for (int k = 0; k < 4; k++) allocated &= runtime::allocate(w->project_positions[k], patches * kProjectChannels[k]);
-    for (int k = 0; k < 4; k++) allocated &= runtime::allocate(w->projected[k], patches * kProjectChannels[k]);
-    allocated &= runtime::allocate(w->layer1, 16 * patches * 256);
-    allocated &= runtime::allocate(w->layer2, 4 * patches * 512);
-    allocated &= runtime::allocate(w->layer4, static_cast<size_t>(w->stride2_rows) * w->stride2_columns * 1024);
-    allocated &= runtime::allocate(w->fusion_inputs[0], 16 * patches * kFeatures);
-    allocated &= runtime::allocate(w->fusion_inputs[1], 4 * patches * kFeatures);
-    allocated &= runtime::allocate(w->fusion_inputs[2], patches * kFeatures);
-    allocated &=
-        runtime::allocate(w->fusion_inputs[3], static_cast<size_t>(w->stride2_rows) * w->stride2_columns * kFeatures);
-    allocated &= runtime::allocate(w->temporary, 16 * patches * kFeatures);
-    allocated &= runtime::allocate(w->refined, 16 * patches * kFeatures);
-    allocated &= runtime::allocate(w->fused, 16 * patches * kFeatures);
-    allocated &= runtime::allocate(w->upsampled, 64 * patches * kFeatures);
-    allocated &= runtime::allocate(w->fusion_output, 64 * patches * kFeatures);
-    allocated &= runtime::allocate(w->head_features, 64 * patches * 128);
-    allocated &= runtime::allocate(w->image_features, H * W * 128);
-    allocated &= runtime::allocate(w->last_hidden_rows, H * W * 32);
-    allocated &= runtime::allocate(w->column_positions, W * 64);
-    allocated &= runtime::allocate(w->row_positions, H * 64);
-    allocated &= runtime::allocate(w->transposed_rows[0], patches);
-    allocated &= runtime::allocate(w->transposed_rows[1], patches);
-    w->stride2_taps = make_tap_map(patch_rows, patch_columns, 2, w->stride2_rows, w->stride2_columns);
-    if (!allocated || !w->stride2_taps) {
-        *w = DptWorkspace{};
-        return std::unexpected(runtime::Error::kNoMemory);
-    }
-
-    for (int i = 0; i < patch_rows; i++) {  // transposed convolutions: input pixel -> its tap (0, 0) output row
-        for (int j = 0; j < patch_columns; j++) {
-            w->transposed_rows[0][i * patch_columns + j] = 4 * i * 4 * patch_columns + 4 * j;
-            w->transposed_rows[1][i * patch_columns + j] = 2 * i * 2 * patch_columns + 2 * j;
-        }
-    }
-
-    const float * table = position_tables;
-    for (int k = 0; k < 4; k++) {
-        const int C = kProjectChannels[k];
-        const float * columns = table;
-        const float * rows = table + static_cast<size_t>(patch_columns) * C / 2;
-        for (int y = 0; y < patch_rows; y++) {
-            for (int x = 0; x < patch_columns; x++) {
-                _Float16 * destination =
-                    w->project_positions[k].get() + (static_cast<size_t>(y) * patch_columns + x) * C;
-                for (int c = 0; c < C / 2; c++) {
-                    destination[c] = static_cast<_Float16>(columns[static_cast<size_t>(x) * C / 2 + c]);
-                    destination[C / 2 + c] = static_cast<_Float16>(rows[static_cast<size_t>(y) * C / 2 + c]);
-                }
-            }
-        }
-        table += static_cast<size_t>(patch_columns + patch_rows) * C / 2;
-    }
-    memcpy(w->column_positions.get(), table, W * 64 * 4);
-    memcpy(w->row_positions.get(), table + W * 64, H * 64 * 4);
-    return {};
-}
-
-struct NormJob {
-    const _Float16 * source;
-    const float * gamma;
-    const float * beta;
-    _Float16 * destination;
-    int first_row;
-};
-
-void normalize_row(void * context, int row, int) {
-    const auto * job = static_cast<const NormJob *>(context);
-    const auto * x = hvx::vectors(job->source + static_cast<size_t>(job->first_row + row) * 2048);
-    hvx::prefetch_to_l2(x + 32, 4096, 4096, 1);
-
-    Vector<float> sum = Vector<float>::zero();
-    Vector<float> square = Vector<float>::zero();
-    for (int k = 0; k < 32; k++) {
-        const VectorPair<float> values = to_float32(x[k]);
-        sum = sum + values.low() + values.high();
-        square = square + values.low() * values.low() + values.high() * values.high();
-    }
-
-    const float mean = hvx::horizontal_sum(sum) * (1.0f / 2048);
-    const float variance = hvx::horizontal_sum(square) * (1.0f / 2048) - mean * mean;
-    const Vector<float> inverse =
-        Vector<float>::splat(hvx::reciprocal_square_root((variance > 0 ? variance : 0) + 1e-5f));
-    const Vector<float> negative = Vector<float>::splat(-mean);
-
-    const auto * gamma = hvx::vectors(job->gamma);
-    const auto * beta = hvx::vectors(job->beta);
-    auto * out = hvx::vectors(job->destination + static_cast<size_t>(row) * 2048);
-    for (int k = 0; k < 32; k++) {
-        const VectorPair<float> values = to_float32(x[k]);
-        out[k] = to_float16((values.low() + negative) * inverse * gamma[2 * k] + beta[2 * k],
-                            (values.high() + negative) * inverse * gamma[2 * k + 1] + beta[2 * k + 1]);
-    }
-}
-
-struct ResampleJob {
-    const _Float16 * source;
-    _Float16 * destination;
-    int input_rows;
-    int input_columns;
-    int output_rows;
-    int output_columns;
-    int channels;
-    const float * column_positions;  // final resampling: + position embedding (channels < 64 by column, >= 64 by row)
-    const float * row_positions;
-};
-
-// Bilinear, align_corners=True.
-void resample_row(void * context, int oy, int) {
-    const auto * job = static_cast<const ResampleJob *>(context);
-    const float fy = job->output_rows > 1 ? static_cast<float>(oy) * static_cast<float>(job->input_rows - 1) /
-                                                static_cast<float>(job->output_rows - 1)
-                                          : 0.0f;
-    const int y0 = static_cast<int>(fy);
-    const int y1 = y0 + 1 < job->input_rows ? y0 + 1 : y0;
-    const float ly = fy - static_cast<float>(y0);
-    const int vectors = job->channels / 64;
-    hvx::prefetch_to_l2(job->source + static_cast<size_t>(y0) * job->input_columns * job->channels,
-                        static_cast<uint32_t>(job->input_columns) * job->channels * 2,
-                        static_cast<uint32_t>(y1 - y0) * job->input_columns * job->channels * 2, 2);
-
-    for (int ox = 0; ox < job->output_columns; ox++) {
-        const float fx = job->output_columns > 1 ? static_cast<float>(ox) * static_cast<float>(job->input_columns - 1) /
-                                                       static_cast<float>(job->output_columns - 1)
-                                                 : 0.0f;
-        const int x0 = static_cast<int>(fx);
-        const int x1 = x0 + 1 < job->input_columns ? x0 + 1 : x0;
-        const float lx = fx - static_cast<float>(x0);
-        const Vector<float> w00 = Vector<float>::splat((1 - ly) * (1 - lx));
-        const Vector<float> w01 = Vector<float>::splat((1 - ly) * lx);
-        const Vector<float> w10 = Vector<float>::splat(ly * (1 - lx));
-        const Vector<float> w11 = Vector<float>::splat(ly * lx);
-
-        const auto * a =
-            hvx::vectors(job->source + (static_cast<size_t>(y0) * job->input_columns + x0) * job->channels);
-        const auto * b =
-            hvx::vectors(job->source + (static_cast<size_t>(y0) * job->input_columns + x1) * job->channels);
-        const auto * c =
-            hvx::vectors(job->source + (static_cast<size_t>(y1) * job->input_columns + x0) * job->channels);
-        const auto * d =
-            hvx::vectors(job->source + (static_cast<size_t>(y1) * job->input_columns + x1) * job->channels);
-        auto * out =
-            hvx::vectors(job->destination + (static_cast<size_t>(oy) * job->output_columns + ox) * job->channels);
-
-        for (int k = 0; k < vectors; k++) {
-            const VectorPair<float> ea = to_float32(a[k]);
-            const VectorPair<float> eb = to_float32(b[k]);
-            const VectorPair<float> ec = to_float32(c[k]);
-            const VectorPair<float> ed = to_float32(d[k]);
-            Vector<float> low = (ea.low() * w00 + eb.low() * w01) + (ec.low() * w10 + ed.low() * w11);
-            Vector<float> high = (ea.high() * w00 + eb.high() * w01) + (ec.high() * w10 + ed.high() * w11);
-            if (job->column_positions) {
-                const float * table = k == 0 ? job->column_positions + static_cast<size_t>(ox) * 64
-                                             : job->row_positions + static_cast<size_t>(oy) * 64;
-                low = low + hvx::vectors(table)[0];
-                high = high + hvx::vectors(table)[1];
-            }
-            out[k] = to_float16(low, high);
-        }
-    }
-}
-
-runtime::Status resample(runtime::Session & session, const _Float16 * source, int input_rows, int input_columns,
-                         _Float16 * destination, int output_rows, int output_columns, int channels,
-                         const float * column_positions, const float * row_positions) {
-    ResampleJob job{source,         destination, input_rows,       input_columns, output_rows,
-                    output_columns, channels,    column_positions, row_positions};
-    return runtime::parallel_for(session, runtime::kHvxThreads, output_rows, resample_row, &job);
-}
-
 struct LastConvolutionJob {
     const float * hidden_rows;
     const float * weights;
@@ -632,184 +393,50 @@ void last_convolution(void * context, int item, int) {
     }
 }
 
-// The DPT head's convolutions, then its other parts (dpt_head_part) at kCount.
-struct HeadWeights {
-    LayerWeights parts[convolution::kCount + 1];
+// The depth and point heads' own buffer: output_conv2.0's output, the last convolution's input [pixels][32] (fp32).
+struct DptHeadWorkspace {
+    size_t pixels;
+    runtime::HeapArray<float> hidden_rows;
 };
 
-runtime::Status convolve(runtime::Session & session, const HeadWeights * head, int which, const _Float16 * input,
-                         int row_stride, const int * input_map, int taps, bool relu_input, int M, int K, int N,
-                         gemm_fp16::Arguments output, int tap_width) {
-    output.input_rows = input;
-    output.row_stride = row_stride;
-    output.input_map = input_map;
-    output.taps = taps;
-    output.relu_input = relu_input;
-    output.weights = head->parts[which].part<uint8_t>(protocol::vggt::dpt_convolution_part::kWeights);
-    output.tap_width = tap_width;
-    output.M = M;
-    output.K = K;
-    output.N = N;
-    return kernels::gemm_fp16::run(session, output);
+runtime::Status allocate_dpt_head_workspace(DptHeadWorkspace * w, size_t pixels) {
+    if (w->hidden_rows && w->pixels == pixels) return {};
+
+    *w = DptHeadWorkspace{};
+    if (!runtime::allocate(w->hidden_rows, pixels * 32)) return std::unexpected(runtime::Error::kNoMemory);
+    w->pixels = pixels;
+    return {};
 }
 
-gemm_fp16::Arguments f16_output(_Float16 * out, int channels, const _Float16 * residual, bool relu_residual,
-                                const _Float16 * second_residual, bool relu) {
-    gemm_fp16::Arguments output;
-    output.f16_groups[0] = out;
-    output.f16_group_width = channels;
-    output.residual = residual;
-    output.relu_residual = relu_residual;
-    output.second_residual = second_residual;
-    output.relu_output = relu;
-    return output;
-}
-
-// conv2(relu(conv1(relu(x)))) + relu(x) [+ skip]: DPT's inplace ReLU also rectifies the residual.
-runtime::Status residual_conv_unit(runtime::Session & session, const HeadWeights * head, int conv1, const _Float16 * x,
-                                   int pixels, int tap_width, const _Float16 * skip, _Float16 * temporary,
-                                   _Float16 * out) {
-    const runtime::Status first =
-        convolve(session, head, conv1, x, kFeatures, nullptr, 9, 1, pixels, 9 * kFeatures, kFeatures,
-                 f16_output(temporary, kFeatures, nullptr, 0, nullptr, 1), tap_width);
-    if (!first) return first;
-    return convolve(session, head, conv1 + 1, temporary, kFeatures, nullptr, 9, 0, pixels, 9 * kFeatures, kFeatures,
-                    f16_output(out, kFeatures, x, 1, skip, 0), tap_width);
-}
-
-runtime::Status run_frame(runtime::Session & session, const HeadWeights * head, DptWorkspace * w,
-                          const _Float16 * const kept[4], int frame, int tokens_per_frame, int channels, float * out,
+runtime::Status run_frame(runtime::Session & session, const dpt_head::HeadWeights & head, dpt_head::Workspace * w,
+                          float * hidden_rows, const KeptOutputs & kept, int frame, int channels, float * out,
                           int32_t * statistics) {
-    const int patches = w->patch_rows * w->patch_columns;
-    const int stride2_pixels = w->stride2_rows * w->stride2_columns;
-    const int image_pixels = w->height * w->width;
-    const auto * norm_gamma = head->parts[convolution::kCount].part<float>(protocol::vggt::dpt_head_part::kNormGamma);
-    const auto * norm_beta = head->parts[convolution::kCount].part<float>(protocol::vggt::dpt_head_part::kNormBeta);
-    runtime::Status status;
+    const LayerWeights & misc = head.parts[convolution::kCount];
+    runtime::Status status = dpt_head::run_trunk(
+        session, head, w, kept.outputs, frame * kept.tokens_per_frame + kSpecialTokens,
+        misc.part<float>(dpt_head_part::kNormGamma), misc.part<float>(dpt_head_part::kNormBeta), statistics);
+    if (!status) return status;
     runtime::StageTimer timer(statistics);
-
-    for (int k = 0; k < 4; k++) {
-        NormJob norm_job{kept[k], norm_gamma, norm_beta, w->normalized.get(),
-                         frame * tokens_per_frame + kSpecialTokens};
-        status = runtime::parallel_for(session, runtime::kHvxThreads, patches, normalize_row, &norm_job);
-        if (!status) return status;
-        timer.lap(dpt_stat::kElementwiseMicroseconds);
-        status = convolve(
-            session, head, convolution::kProject0 + k, w->normalized.get(), 2048, nullptr, 1, 0, patches, 2048,
-            kProjectChannels[k],
-            f16_output(w->projected[k].get(), kProjectChannels[k], nullptr, 0, w->project_positions[k].get(), 0), 0);
-        if (!status) return status;
-        timer.lap(dpt_stat::kProjectsMicroseconds);
-    }
-
-    {
-        gemm_fp16::Arguments resize0;
-        resize0.f16_group_width = 256;
-        resize0.output_map = w->transposed_rows[0].get();
-        for (int t = 0; t < 16; t++)
-            resize0.f16_groups[t] = w->layer1.get() + (static_cast<size_t>(t / 4) * 4 * w->patch_columns + t % 4) * 256;
-        gemm_fp16::Arguments resize1;
-        resize1.f16_group_width = 512;
-        resize1.output_map = w->transposed_rows[1].get();
-        for (int t = 0; t < 4; t++)
-            resize1.f16_groups[t] = w->layer2.get() + (static_cast<size_t>(t / 2) * 2 * w->patch_columns + t % 2) * 512;
-        status = convolve(session, head, convolution::kResize0, w->projected[0].get(), 256, nullptr, 1, 0, patches, 256,
-                          16 * 256, resize0, 0);
-        if (!status) return status;
-        status = convolve(session, head, convolution::kResize1, w->projected[1].get(), 512, nullptr, 1, 0, patches, 512,
-                          4 * 512, resize1, 0);
-        if (!status) return status;
-        status =
-            convolve(session, head, convolution::kResize3, w->projected[3].get(), 1024, w->stride2_taps.get(), 9, 0,
-                     stride2_pixels, 9 * 1024, 1024, f16_output(w->layer4.get(), 1024, nullptr, 0, nullptr, 0), 0);
-        if (!status) return status;
-    }
-    timer.lap(dpt_stat::kProjectsMicroseconds);
-
-    status = convolve(session, head, convolution::kLayer1Rn, w->layer1.get(), 256, nullptr, 9, 0, 16 * patches, 9 * 256,
-                      kFeatures, f16_output(w->fusion_inputs[0].get(), kFeatures, nullptr, 0, nullptr, 0),
-                      4 * w->patch_columns);
-    if (!status) return status;
-    status = convolve(session, head, convolution::kLayer2Rn, w->layer2.get(), 512, nullptr, 9, 0, 4 * patches, 9 * 512,
-                      kFeatures, f16_output(w->fusion_inputs[1].get(), kFeatures, nullptr, 0, nullptr, 0),
-                      2 * w->patch_columns);
-    if (!status) return status;
-    status =
-        convolve(session, head, convolution::kLayer3Rn, w->projected[2].get(), 1024, nullptr, 9, 0, patches, 9 * 1024,
-                 kFeatures, f16_output(w->fusion_inputs[2].get(), kFeatures, nullptr, 0, nullptr, 0), w->patch_columns);
-    if (!status) return status;
-    status = convolve(session, head, convolution::kLayer4Rn, w->layer4.get(), 1024, nullptr, 9, 0, stride2_pixels,
-                      9 * 1024, kFeatures, f16_output(w->fusion_inputs[3].get(), kFeatures, nullptr, 0, nullptr, 0),
-                      w->stride2_columns);
-    if (!status) return status;
-    timer.lap(dpt_stat::kLayerRnMicroseconds);
-
-    status = residual_conv_unit(session, head, convolution::kRefine4Unit2Conv1, w->fusion_inputs[3].get(),
-                                stride2_pixels, w->stride2_columns, nullptr, w->temporary.get(), w->fused.get());
-    if (!status) return status;
-    status = resample(session, w->fused.get(), w->stride2_rows, w->stride2_columns, w->upsampled.get(), w->patch_rows,
-                      w->patch_columns, kFeatures, nullptr, nullptr);
-    if (!status) return status;
-    status = convolve(session, head, convolution::kRefine4Output, w->upsampled.get(), kFeatures, nullptr, 1, 0, patches,
-                      kFeatures, kFeatures, f16_output(w->fusion_output.get(), kFeatures, nullptr, 0, nullptr, 0), 0);
-    if (!status) return status;
-
-    constexpr int kRefineFirstConvolution[3] = {convolution::kRefine3Unit1Conv1, convolution::kRefine2Unit1Conv1,
-                                                convolution::kRefine1Unit1Conv1};
-    const _Float16 * layer_inputs[3] = {w->fusion_inputs[2].get(), w->fusion_inputs[1].get(),
-                                        w->fusion_inputs[0].get()};
-    constexpr int kScales[3] = {1, 2, 4};
-    for (int level = 0; level < 3; level++) {
-        const int rows = w->patch_rows * kScales[level];
-        const int columns = w->patch_columns * kScales[level];
-        const int pixels = rows * columns;
-        const int output_rows = 2 * rows;
-        const int output_columns = 2 * columns;
-        const int first = kRefineFirstConvolution[level];
-
-        status = residual_conv_unit(session, head, first, layer_inputs[level], pixels, columns, w->fusion_output.get(),
-                                    w->temporary.get(), w->fused.get());
-        if (!status) return status;
-
-        status = residual_conv_unit(session, head, first + 2, w->fused.get(), pixels, columns, nullptr,
-                                    w->temporary.get(), w->refined.get());
-        if (!status) return status;
-
-        status = resample(session, w->refined.get(), rows, columns, w->upsampled.get(), output_rows, output_columns,
-                          kFeatures, nullptr, nullptr);
-        if (!status) return status;
-        status = convolve(session, head, first + 4, w->upsampled.get(), kFeatures, nullptr, 1, 0,
-                          output_rows * output_columns, kFeatures, kFeatures,
-                          f16_output(w->fusion_output.get(), kFeatures, nullptr, 0, nullptr, 0), 0);
-        if (!status) return status;
-    }
-    timer.lap(dpt_stat::kRefineNetsMicroseconds);
-
-    status = convolve(session, head, convolution::kOutputConv1, w->fusion_output.get(), kFeatures, nullptr, 9, 0,
-                      64 * patches, 9 * kFeatures, 128, f16_output(w->head_features.get(), 128, nullptr, 0, nullptr, 0),
-                      8 * w->patch_columns);
-    if (!status) return status;
-    timer.lap(dpt_stat::kOutputConvolutionsMicroseconds);
-    status = resample(session, w->head_features.get(), 8 * w->patch_rows, 8 * w->patch_columns, w->image_features.get(),
-                      w->height, w->width, 128, w->column_positions.get(), w->row_positions.get());
+    status = dpt_head::upsample_to_image(session, w, false);
     if (!status) return status;
     timer.lap(dpt_stat::kElementwiseMicroseconds);
     gemm_fp16::Arguments output;
     output.output_form = kernels::gemm_fp16::OutputForm::kRowsF32;
-    output.rows_f32 = w->last_hidden_rows.get();
+    output.rows_f32 = hidden_rows;
     output.relu_output = true;
-    status = convolve(session, head, convolution::kOutputConv2, w->image_features.get(), 128, nullptr, 9, 0,
-                      image_pixels, 9 * 128, 32, output, w->width);
+    const int image_pixels = w->height * w->width;
+    status =
+        dpt_head::convolve(session, head, convolution::kOutputConv2, w->image_features.get(), dpt_head::kHeadFeatures,
+                           nullptr, 9, 0, image_pixels, 9 * dpt_head::kHeadFeatures, 32, output, w->width);
     if (!status) return status;
     timer.lap(dpt_stat::kOutputConvolutionsMicroseconds);
 
-    LastConvolutionJob last_job{
-        w->last_hidden_rows.get(),
-        head->parts[convolution::kCount].part<float>(protocol::vggt::dpt_head_part::kLastConvWeights),
-        head->parts[convolution::kCount].part<float>(protocol::vggt::dpt_head_part::kLastConvBias),
-        out,
-        channels,
-        image_pixels};
+    LastConvolutionJob last_job{hidden_rows,
+                                misc.part<float>(dpt_head_part::kLastConvWeights),
+                                misc.part<float>(dpt_head_part::kLastConvBias),
+                                out,
+                                channels,
+                                image_pixels};
     status =
         runtime::parallel_for(session, runtime::kHvxThreads, (image_pixels + 31) / 32, last_convolution, &last_job);
     if (!status) return status;
@@ -953,43 +580,54 @@ runtime::Status run_dpt_head(runtime::Session & session, const DptHeadArguments 
     const runtime::ExclusiveUse use(guard->in_use);
     if (!use.taken()) return std::unexpected(runtime::Error::kBadParameter);
     runtime::StageTimer call_timer(arguments.statistics);
-    TransformerGeometry geometry;
-    const _Float16 * kept[4];
-    for (int k = 0; k < 4; k++) {
-        kept[k] = kept_output(session, k, &geometry);
-        if (kept[k] == nullptr) return std::unexpected(runtime::Error::kBadParameter);
-    }
+    const KeptOutputs kept = kept_outputs(session);
+    if (kept.outputs[0] == nullptr) return std::unexpected(runtime::Error::kBadParameter);
     if (arguments.channels != 2 && arguments.channels != 4) return std::unexpected(runtime::Error::kBadParameter);
-    HeadWeights head{};
-    for (int i = 0; i <= convolution::kCount; i++) {
-        const runtime::Result<LayerWeights> part =
-            layer_in_model(session, arguments.references +
-                                        i * protocol::blob_references(protocol::vggt::dpt_convolution_part::kCount));
-        if (!part) return std::unexpected(part.error());
-        head.parts[i] = *part;
+    dpt_head::HeadWeights head{};
+    if (const runtime::Status loaded = dpt_head::load_head(session, arguments.references, &head); !loaded) {
+        return loaded;
     }
-    if (arguments.position_values != position_table_values(geometry.patch_rows, geometry.patch_columns)) {
+    if (arguments.position_values != dpt_head::position_table_values(kept.patch_rows, kept.patch_columns, kPatchSize)) {
         return std::unexpected(runtime::Error::kBadParameter);
     }
 
-    DptWorkspace * kept_workspace = session.state<DptWorkspace>();
-    if (kept_workspace == nullptr) return std::unexpected(runtime::Error::kNoMemory);
-    DptWorkspace & workspace = *kept_workspace;
+    DptHeadWorkspace * own = session.state<DptHeadWorkspace>();
+    if (own == nullptr) return std::unexpected(runtime::Error::kNoMemory);
     runtime::StageTimer workspace_timer(arguments.statistics);
-    const runtime::Status allocated =
-        allocate_workspace(&workspace, geometry.patch_rows, geometry.patch_columns, arguments.position_tables);
+    const runtime::Result<dpt_head::Workspace *> workspace = dpt_head::session_workspace(
+        session, kept.patch_rows, kept.patch_columns, kPatchSize, arguments.position_tables);
+    if (!workspace) return std::unexpected(workspace.error());
+    dpt_head::Workspace * w = *workspace;
+    const runtime::Status allocated = allocate_dpt_head_workspace(own, static_cast<size_t>(w->height) * w->width);
     workspace_timer.lap(dpt_stat::kWorkspaceMicroseconds);
     if (!allocated) return allocated;
 
-    for (int frame = 0; frame < geometry.frames; frame++) {
-        const runtime::Status ran = run_frame(
-            session, &head, &workspace, kept, frame, geometry.tokens_per_frame, arguments.channels,
-            arguments.out + static_cast<size_t>(frame) * workspace.height * workspace.width * arguments.channels,
-            arguments.statistics);
+    for (int frame = 0; frame < kept.frames; frame++) {
+        const runtime::Status ran =
+            run_frame(session, head, w, own->hidden_rows.get(), kept, frame, arguments.channels,
+                      arguments.out + static_cast<size_t>(frame) * w->height * w->width * arguments.channels,
+                      arguments.statistics);
         if (!ran) return ran;
     }
     call_timer.lap(dpt_stat::kTotalMicroseconds);
     return {};
+}
+
+KeptOutputs kept_outputs(runtime::Session & session) {
+    KeptOutputs kept{};
+    TransformerGeometry geometry{};
+    for (int k = 0; k < protocol::vggt::kKeptOutputs; k++) kept.outputs[k] = kept_output(session, k, &geometry);
+    if (kept.outputs[0] == nullptr) return KeptOutputs{};
+    kept.frames = geometry.frames;
+    kept.tokens_per_frame = geometry.tokens_per_frame;
+    kept.patch_rows = geometry.patch_rows;
+    kept.patch_columns = geometry.patch_columns;
+    return kept;
+}
+
+std::atomic<int> * call_guard(runtime::Session & session) {
+    CallGuard * guard = session.state<CallGuard>();
+    return guard != nullptr ? &guard->in_use : nullptr;
 }
 
 }  // namespace benzene::models::vggt

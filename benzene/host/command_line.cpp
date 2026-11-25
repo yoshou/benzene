@@ -1,6 +1,7 @@
 #include "host/command_line.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +38,18 @@ bool parse_integer(const char * text, const char * what, int minimum, int maximu
         return false;
     }
     *value = static_cast<int>(parsed);
+    return true;
+}
+
+bool parse_float(const char * text, const char * what, float minimum, float maximum, float * value) {
+    char * end = nullptr;
+    errno = 0;
+    const float parsed = strtof(text, &end);
+    if (errno != 0 || end == text || *end != '\0' || !std::isfinite(parsed) || parsed < minimum || parsed > maximum) {
+        fprintf(stderr, "bad %s %s (%g .. %g)\n", what, text, minimum, maximum);
+        return false;
+    }
+    *value = parsed;
     return true;
 }
 

@@ -32,7 +32,7 @@ work/               model data: datasets, checkpoints, evaluation outputs, expor
 3. Set `BOARD_HOST` in `config/board.env`. It currently uses the `Host ventunoq` alias from the host's `~/.ssh/config`.
    - The IP, user, and key come from `~/.ssh/config`. post-create copies the host's `~/.ssh` into the container.
    - Without an alias, set `BOARD_HOST` to `<name>.local` or an IP address, and register your key with `ssh-copy-id arduino@<host>`.
-4. Fetch the models' external inputs into `work/` (about 23 GB) with `scripts/download-inputs.sh`: the source
+4. Fetch the models' external inputs into `work/` (about 26 GB) with `scripts/download-inputs.sh`: the source
    checkouts at pinned commits, the weights checked by SHA-256, the Hugging Face models and datasets at pinned
    revisions, and the TUM RGB-D and Mip-NeRF 360 datasets. What is already there is checked and kept.
 
@@ -53,18 +53,20 @@ host's Docker.
 benzene/build.sh                  # -> build/benzene/pkg/{bin/benzene, lib/libbenzene_skel.so}
 ```
 
-The models: `cosmos3_edge` (the reasoner of nvidia/Cosmos3-Edge), `vggt` (facebook/VGGT-1B), the feature matchers
-`superpoint_lightglue` (SuperPoint + LightGlue), `xfeat_lightglue` (XFeat + its LighterGlue) and `aliked_lightglue`
-(ALIKED + LightGlue), and `loma` (davnords/LoMa). The matchers share `benzene.models.lightglue` (the LightGlue checkout,
-matching, the evaluation pairs and metrics, the device input bundles, the model file's LightGlue tensors and the device
-checks) and on the DSP `dsp/models/lightglue`. The host-side Python is the package `benzene` in `benzene/python`: per
-model (`benzene.models.<model>`) the quantization recipes and their accuracy evaluation (`calibrate`, `evaluate`;
-`prepare_data` in `vggt`, `cosmos3_edge` and, for the matchers, `lightglue`), the export to the device model file
-(`export_hexmodel`), device input bundles (`prepare_bundle`) and checks of the device against PyTorch (`checks`; the
-Cosmos3-Edge stage checks compare with `cosmos3_edge.capture_activations`, LoMa's DINOv2 recipes come from
-`loma.dinov2_quantization`); shared by all of them the kernels' weight streams (`benzene.kernels`), the model file, the
-board access (`benzene.board`, settings from `config/board.env`) and the quantization methods. Run the modules with
-`benzene/python` on the module path, in the models' venv:
+The models: `cosmos3_edge` (the reasoner of nvidia/Cosmos3-Edge), `vggt` (facebook/VGGT-1B), `anysplat`
+(lhjiang/anysplat), the feature matchers `superpoint_lightglue` (SuperPoint + LightGlue), `xfeat_lightglue` (XFeat + its
+LighterGlue) and `aliked_lightglue` (ALIKED + LightGlue), and `loma` (davnords/LoMa). The matchers share
+`benzene.models.lightglue` (the LightGlue checkout, matching, the evaluation pairs and metrics, the device input
+bundles, the model file's LightGlue tensors and the device checks) and on the DSP `dsp/models/lightglue`. AnySplat
+builds on the VGGT port (`benzene.models.vggt`; on the DSP `dsp/models/vggt` and `dsp/models/shared/dpt_head`). The
+host-side Python is the package `benzene` in `benzene/python`: per model (`benzene.models.<model>`) the quantization
+recipes and their accuracy evaluation (`calibrate`, `evaluate`; `prepare_data` in `vggt`, `anysplat`, `cosmos3_edge`
+and, for the matchers, `lightglue`), the export to the device model file (`export_hexmodel`), device input bundles
+(`prepare_bundle`) and checks of the device against PyTorch (`checks`; the Cosmos3-Edge stage checks compare with
+`cosmos3_edge.capture_activations`, LoMa's DINOv2 recipes come from `loma.dinov2_quantization`); shared by all of them
+the kernels' weight streams (`benzene.kernels`), the model file, the board access (`benzene.board`, settings from
+`config/board.env`) and the quantization methods. Run the modules with `benzene/python` on the module path, in the
+models' venv:
 
 ```bash
 export PYTHONPATH=$PWD/benzene/python                 # from the repository root
@@ -83,8 +85,9 @@ calibration, exported models, device input bundles).
 
 Measured 2026-11-24 with the checks below, on the board's Hexagon v75 cDSP (1498 MHz, 4 HVX contexts,
 1 HMX, 8 MiB VTCM). Times are on the DSP. Per image: the median, leaving out the first image of a run (warm-up); per
-pair: the range over the 3 evaluation pairs (TUM RGB-D); LoMa: means, leaving out each run's first image and pair. The
-device's outputs are compared with the same recipe run in PyTorch, unless the entry names another reference.
+pair: the range over the 3 evaluation pairs (TUM RGB-D); LoMa: means, leaving out each run's first image and pair;
+AnySplat: times the medians and accuracy the means over 24 samples. The device's outputs are compared with the same
+recipe run in PyTorch, unless the entry names another reference.
 
 | Model (recipe) | Input | Time on the DSP | Device vs PyTorch |
 |---|---|---|---|
@@ -93,6 +96,7 @@ device's outputs are compared with the same recipe run in PyTorch, unless the en
 | ALIKED + LightGlue (`dev+fp16`) | 480×640, up to 1024 keypoints | ALIKED 27.7 ms; LightGlue 12–20 ms, adaptive 7–12 ms | keypoints, scores and descriptors bit for bit; matches 99.1%, 99.3% (adaptive 99.6%, 99.5%) |
 | LoMa (`dev+w8a8+fp16`) | detector 1024×768, descriptor 644×476 | 441 ms per image, matcher 151 ms, 1.03 s per pair | keypoints and probabilities bit for bit; matches 98.4%, 98.3% |
 | VGGT-1B (`w8a8_tfc`) | 8 frames 392×518 (8328 tokens) | transformer 4.43 s, heads 1.52 s (camera 0.08, depth 0.74, points 0.70) | vs fp32: depth 0.35%, points 0.78%, rotation 0.11°; pose AUC@30 0.917 (fp32 0.917) |
+| AnySplat (`w8a8_tfc`) | 8 frames 448×448 (8232 tokens) | transformer 4.40 s, heads 1.93 s (camera 0.08, depth 0.75, Gaussians 1.10) | vs fp32: renders PSNR 25.3 dB, depth 1.0%, rotation 0.77°; vs the held-out views PSNR 14.4 dB (fp32 14.5) |
 | Cosmos3-Edge vision (`w8a8_sq05s_gptq`) | 8 images, 9600 patches | 1.33 s | relative RMS error 6.6%; vs fp32 6.7% (PyTorch 6.8%) |
 | Cosmos3-Edge LLM prefill | 1024 tokens | 288 ms | relative RMS error 6.7%; vs fp32 7.3% (PyTorch 6.9%) |
 | Cosmos3-Edge LLM decode | 5 tokens after a 2490-token video prompt | 48.1 ms per token; 4-bit decode weights 31.6 ms | vs BF16: KL 0.0034, top-1 100% (PyTorch 0.012, 83%); 4-bit 0.037, 83% |
@@ -107,6 +111,7 @@ $PY -m benzene.models.xfeat_lightglue.checks.end_to_end dev+fp16 --pairs 0 1 2  
 $PY -m benzene.models.aliked_lightglue.checks.end_to_end dev+fp16 --pairs 0 1 2          # and with --adaptive
 $PY -m benzene.models.loma.checks.end_to_end --pairs 0 1 2
 $PY -m benzene.models.vggt.checks.end_to_end w8a8_tfc --samples 0 1 2
+$PY -m benzene.models.anysplat.checks.end_to_end w8a8_tfc --samples 0-23
 $PY -m benzene.models.cosmos3_edge.checks.vision w8a8_sq05s_gptq
 $PY -m benzene.models.cosmos3_edge.checks.llm_prefill w8a8_sq05s_gptq --tokens 1024
 $PY -m benzene.models.cosmos3_edge.checks.llm_decode w8a8_sq05s_gptq                     # and with --dec4 dev_w8a8_q4hs

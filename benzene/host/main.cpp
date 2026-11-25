@@ -19,6 +19,7 @@ const Command kCommands[] = {
     {"aliked_lightglue", run_aliked_lightglue},
     {"loma", run_loma},
     {"vggt", run_vggt},
+    {"anysplat", run_anysplat},
     {"cosmos3_edge_llm_prefill", run_cosmos3_edge_llm_prefill},
     {"cosmos3_edge_llm_decode", run_cosmos3_edge_llm_decode},
     {"cosmos3_edge_vision", run_cosmos3_edge_vision},

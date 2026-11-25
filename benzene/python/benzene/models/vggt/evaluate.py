@@ -63,20 +63,23 @@ def upper_half(conf: torch.Tensor) -> torch.Tensor:
 
 
 def deviation(q: dict, r: dict) -> dict:
+    """q's deviation from the reference r; pts only when r has world points (ports of VGGT-architecture models
+    without the point head leave it out)."""
     hw = r["depth"].shape[-2:]
     m = upper_half(r["depth_conf"])
     rel = (q["depth"] / r["depth"] - 1).abs()
-    mp = upper_half(r["world_points_conf"])
-    pr = r["world_points"][mp]
-    scale = (pr - pr.median(0).values).norm(dim=-1).mean()
+    out = {"dep": rel[m].mean().item(), "dep_all": rel.mean().item()}
+    if "world_points" in r:
+        mp = upper_half(r["world_points_conf"])
+        pr = r["world_points"][mp]
+        scale = (pr - pr.median(0).values).norm(dim=-1).mean()
+        out["pts"] = ((q["world_points"][mp] - pr).norm(dim=-1).mean() / scale).item()
     eq, iq = cameras(q["pose_enc"], hw)
     er, ir = cameras(r["pose_enc"], hw)
     tn = er[:, :, 3].norm(dim=-1)
     fq = torch.rad2deg(q["pose_enc"][:, 7:].double())
     fr = torch.rad2deg(r["pose_enc"][:, 7:].double())
-    return {
-        "dep": rel[m].mean().item(), "dep_all": rel.mean().item(),
-        "pts": ((q["world_points"][mp] - pr).norm(dim=-1).mean() / scale).item(),
+    return out | {
         "rot": rot_angle(eq[:, :, :3], er[:, :, :3]).mean().item(),
         "trans": ((eq[:, :, 3] - er[:, :, 3]).norm(dim=-1).mean() / tn[1:].mean()).item(),
         "fov": (fq - fr).abs().mean().item(),

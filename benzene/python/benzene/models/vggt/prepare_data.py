@@ -44,8 +44,9 @@ TUM_K = {"freiburg1": (517.3, 516.5, 318.6, 255.3), "freiburg2": (520.9, 521.0, 
 TARGET = 518
 
 
-def preprocess(path: Path) -> tuple[np.ndarray, tuple[float, float], int]:
-    """load_and_preprocess_images (crop) for one image -> (uint8 [3, H, W], (sx, sy) resize factors, crop offset y)."""
+def preprocess(path: Path) -> tuple[np.ndarray, tuple[float, float], tuple[int, int]]:
+    """load_and_preprocess_images (crop) for one image -> (uint8 [3, H, W], (sx, sy) resize factors, (left, top) crop
+    offsets)."""
     img = Image.open(path)
     if img.mode == "RGBA":
         bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
@@ -57,13 +58,13 @@ def preprocess(path: Path) -> tuple[np.ndarray, tuple[float, float], int]:
     y0 = (nh - TARGET) // 2 if nh > TARGET else 0
     if nh > TARGET:
         a = a[:, y0 : y0 + TARGET]
-    return np.ascontiguousarray(a), (nw / w, nh / h), y0
+    return np.ascontiguousarray(a), (nw / w, nh / h), (0, y0)
 
 
-def scale_intri(fx, fy, cx, cy, s, y0) -> np.ndarray:
-    """Pinhole intrinsics after a resize by s = (sx, sy) (pixel centres at +0.5) and a crop of y0 rows."""
-    return np.array([[fx * s[0], 0, (cx + 0.5) * s[0] - 0.5], [0, fy * s[1], (cy + 0.5) * s[1] - 0.5 - y0], [0, 0, 1]],
-                    np.float32)
+def scale_intri(fx, fy, cx, cy, s, offset) -> np.ndarray:
+    """Pinhole intrinsics after a resize by s = (sx, sy) (pixel centres at +0.5) and a crop at offset = (left, top)."""
+    return np.array([[fx * s[0], 0, (cx + 0.5) * s[0] - 0.5 - offset[0]],
+                     [0, fy * s[1], (cy + 0.5) * s[1] - 0.5 - offset[1]], [0, 0, 1]], np.float32)
 
 
 def quat_to_rot(q) -> np.ndarray:  # (qx, qy, qz, qw)
@@ -115,15 +116,16 @@ class Tum:
         start = int(rng.integers(0, n - (S - 1) * stride))
         return [int(self.valid[start + k * stride]) for k in range(S)]
 
-    def frame(self, i: int) -> dict:
-        img, s, y0 = preprocess(self.dir / self.rgb[i])
+    def frame(self, i: int, preprocess=preprocess) -> dict:
+        """Frame i through `preprocess` (this module's, or another port's of the same signature)."""
+        img, s, (left, top) = preprocess(self.dir / self.rgb[i])
         H, W = img.shape[1:]
         d = np.asarray(Image.open(self.dir / self.dep[self.di[i]]), np.float32) / 5000.0
         h0, w0 = d.shape
-        ys = np.clip(((np.arange(H) + y0 + 0.5) / s[1]).astype(int), 0, h0 - 1)  # nearest source pixel
-        xs = np.clip(((np.arange(W) + 0.5) / s[0]).astype(int), 0, w0 - 1)
+        ys = np.clip(((np.arange(H) + top + 0.5) / s[1]).astype(int), 0, h0 - 1)  # nearest source pixel
+        xs = np.clip(((np.arange(W) + left + 0.5) / s[0]).astype(int), 0, w0 - 1)
         g = self.gt[self.gi[i]]
-        return {"name": self.rgb[i], "img": img, "intri": scale_intri(*self.K, s, y0),
+        return {"name": self.rgb[i], "img": img, "intri": scale_intri(*self.K, s, (left, top)),
                 "extri": w2c_from_c2w(quat_to_rot(g[3:7]), g[:3]), "depth": d[ys][:, xs].astype(np.float16)}
 
 
@@ -147,12 +149,13 @@ class Mip360:
         near = np.argsort(np.linalg.norm(self.t - self.t[a], axis=1))[:24]
         return sorted([a] + rng.choice(near[1:], S - 1, replace=False).tolist())
 
-    def frame(self, i: int) -> dict:
-        img, s, y0 = preprocess(self.files[i])
+    def frame(self, i: int, preprocess=preprocess) -> dict:
+        """Frame i through `preprocess` (this module's, or another port's of the same signature)."""
+        img, s, offset = preprocess(self.files[i])
         w8 = Image.open(self.files[i]).size[0]
         H, W, f = self.hwf
         r = w8 / W  # images_8 relative to the full resolution
-        K = scale_intri(f * r, f * r, W * r / 2 - 0.5, H * r / 2 - 0.5, s, y0)
+        K = scale_intri(f * r, f * r, W * r / 2 - 0.5, H * r / 2 - 0.5, s, offset)
         return {"name": self.files[i].name, "img": img, "intri": K, "extri": w2c_from_c2w(self.c2w[i], self.t[i]),
                 "depth": None}
 

@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 #include "dsp/runtime/session.h"
 #include "dsp/runtime/status.h"
+#include "benzene/protocol.h"
 
 namespace benzene::models::vggt {
 
@@ -57,11 +59,26 @@ struct DptHeadArguments {
     int position_values = 0;
     int channels = 0;                // 2 (the depth head) or 4 (the point head); the last channel is the confidence
     float * out = nullptr;           // [frames][H][W][channels]
-    int32_t * statistics = nullptr;  // dpt_stat
+    int32_t * statistics = nullptr;  // dpt_head::stat
 };
 
 // One head over all frames of the last run_transformer, on its kept outputs (patch tokens of frame / global blocks 4,
 // 11, 17, 23).
 runtime::Status run_dpt_head(runtime::Session & session, const DptHeadArguments & arguments);
+
+// For heads built on VGGT's transformer (dsp/models/anysplat), which run one at a time with the calls above: the guard
+// of the calls, which such a head holds for its call (runtime::ExclusiveUse; nullptr when out of memory), and, read
+// while holding it, the kept outputs of the last run_transformer (fp16 [frames * tokens_per_frame][kKeptOutputWidth]
+// each; all nullptr when there are none) and their geometry.
+std::atomic<int> * call_guard(runtime::Session & session);
+
+struct KeptOutputs {
+    const _Float16 * outputs[protocol::vggt::kKeptOutputs];
+    int frames;
+    int tokens_per_frame;
+    int patch_rows;
+    int patch_columns;
+};
+KeptOutputs kept_outputs(runtime::Session & session);
 
 }  // namespace benzene::models::vggt

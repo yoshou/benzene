@@ -59,6 +59,12 @@ interface benzene : remote_handle64 {
     // confidence).
     AEEResult vggt_dpt_head(in sequence<int32> references, in uint32 channels, in sequence<float> position_tables,
                             rout sequence<float> y, rout sequence<int32> statistics);
+    // AnySplat's Gaussian head (its transformer, camera and depth heads are the vggt_* calls) for frame `frame` of the
+    // last vggt_transformer call: references kGaussianReferences; position_tables as vggt_dpt_head's; image the frame's
+    // pixels [3][height][width]; y [height][width][kGaussianOutputChannels] fp16, the raw Gaussian of every pixel.
+    AEEResult anysplat_gaussian_head(in sequence<int32> references, in sequence<float> position_tables,
+                                     in uint32 frame, in sequence<uint8> image, rout sequence<uint16> y,
+                                     rout sequence<int32> statistics);
 
     // An extractor on a gray image [height][width]: references kReferences; the k <= max_keypoints keypoints (x, y),
     // their scores and fp16 descriptors [k][kDescriptorDimensions]; the features also stay in feature slot
